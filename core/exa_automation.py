@@ -15,6 +15,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -150,21 +151,38 @@ class ExaAutomation:
         entered_dashboard = False
         otp_wait_start = time.time()
         page.wait_for_timeout(700)
-        deadline = time.time() + 20.0
+        deadline = time.time() + 22.0
         while time.time() < deadline:
             current_url = page.url
-            if "dashboard.exa.ai" in current_url:
+            if self._get_url_host(current_url) == "dashboard.exa.ai":
                 entered_dashboard = True
                 break
             if invalid_tip.count() and invalid_tip.first.is_visible():
                 raise RuntimeError("OTP 无效，Exa 返回 Invalid verification code")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=1200)
+            except Exception:
+                pass
             page.wait_for_timeout(300)
 
         if not entered_dashboard:
             current_url = page.url
             if invalid_tip.count() and invalid_tip.first.is_visible():
                 raise RuntimeError("OTP 无效，Exa 返回 Invalid verification code")
-            raise RuntimeError(f"OTP 提交后未进入 Exa Dashboard，当前页面: {current_url}")
+            # 若仍停留在 auth.exa.ai，尝试手动打开 dashboard 触发会话写入
+            if self._get_url_host(current_url) == "auth.exa.ai":
+                self._log("warning", "⚠️ OTP 后未自动跳转 Dashboard，尝试手动打开...")
+                self._safe_goto(
+                    page,
+                    "https://dashboard.exa.ai/",
+                    wait_until="domcontentloaded",
+                    timeout=self.timeout_ms,
+                    retries=2,
+                )
+                if self._get_url_host(page.url) == "dashboard.exa.ai":
+                    entered_dashboard = True
+            if not entered_dashboard:
+                raise RuntimeError(f"OTP 提交后未进入 Exa Dashboard，当前页面: {current_url}")
 
         otp_wait_cost = time.time() - otp_wait_start
         if otp_wait_cost > 8:
@@ -177,7 +195,13 @@ class ExaAutomation:
 
     def _complete_onboarding(self, page) -> Optional[str]:
         onboarding_key = None
-        page.goto("https://dashboard.exa.ai/onboarding", wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._safe_goto(
+            page,
+            "https://dashboard.exa.ai/onboarding",
+            wait_until="domcontentloaded",
+            timeout=self.timeout_ms,
+            retries=2,
+        )
         page.wait_for_timeout(1200)
 
         if "onboarding" not in page.url:
@@ -263,7 +287,13 @@ class ExaAutomation:
         return onboarding_key
 
     def _redeem_coupon(self, page, coupon_code: str) -> tuple[Optional[str], str]:
-        page.goto("https://dashboard.exa.ai/billing", wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._safe_goto(
+            page,
+            "https://dashboard.exa.ai/billing",
+            wait_until="domcontentloaded",
+            timeout=self.timeout_ms,
+            retries=1,
+        )
         page.wait_for_timeout(1200)
 
         def read_balance_with_retry(timeout_sec: float = 12.0) -> Optional[str]:
@@ -360,7 +390,13 @@ class ExaAutomation:
         return balance, coupon_status
 
     def _create_api_key(self, page) -> str:
-        page.goto("https://dashboard.exa.ai/api-keys", wait_until="domcontentloaded", timeout=self.timeout_ms)
+        self._safe_goto(
+            page,
+            "https://dashboard.exa.ai/api-keys",
+            wait_until="domcontentloaded",
+            timeout=self.timeout_ms,
+            retries=1,
+        )
         page.wait_for_timeout(1000)
 
         create_btn = page.locator('button:has-text("Create Key")').first
@@ -445,6 +481,40 @@ class ExaAutomation:
             if loc.count() and loc.is_visible():
                 return loc
         return None
+
+    @staticmethod
+    def _get_url_host(url: str) -> str:
+        try:
+            return urlparse(url).hostname or ""
+        except Exception:
+            return ""
+
+    def _safe_goto(
+        self,
+        page,
+        url: str,
+        wait_until: str = "domcontentloaded",
+        timeout: Optional[int] = None,
+        retries: int = 1,
+    ) -> None:
+        last_exc = None
+        effective_timeout = timeout or self.timeout_ms
+        for attempt in range(retries + 1):
+            try:
+                page.goto(url, wait_until=wait_until, timeout=effective_timeout)
+                return
+            except Exception as exc:
+                last_exc = exc
+                if "net::ERR_ABORTED" not in str(exc) or attempt >= retries:
+                    raise
+                self._log("warning", f"⚠️ 页面跳转被中止，重试 {attempt + 1}/{retries}")
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500 + attempt * 300)
+        if last_exc:
+            raise last_exc
 
     def _log(self, level: str, message: str) -> None:
         if not self.log_callback:
