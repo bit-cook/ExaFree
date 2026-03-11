@@ -533,15 +533,16 @@
             <textarea
               v-model="importText"
               class="min-h-[140px] w-full rounded-2xl border border-input bg-background px-3 py-2 text-xs font-mono"
-              placeholder="duckmail----you@example.com----password&#10;moemail----you@moemail.app----emailId&#10;freemail----you@freemail.local&#10;gptmail----you@example.com&#10;cfmail----you@example.com----jwtToken&#10;user@outlook.com----loginPassword----clientId----refreshToken"
+              placeholder="duckmail----you@example.com----password&#10;moemail----you@moemail.app----emailId&#10;freemail----you@freemail.local&#10;gptmail----you@example.com&#10;cfmail----you@example.com----jwtToken&#10;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&#10;user@outlook.com----loginPassword----clientId----refreshToken"
             ></textarea>
             <div class="rounded-2xl border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-              <p>支持三种格式：</p>
+              <p>支持以下格式：</p>
               <p class="mt-1 font-mono">duckmail----email----password</p>
               <p class="mt-1 font-mono">moemail----email----emailId</p>
               <p class="mt-1 font-mono">freemail----email</p>
               <p class="mt-1 font-mono">gptmail----email</p>
               <p class="mt-1 font-mono">cfmail----email----jwtToken</p>
+              <p class="mt-1 font-mono">apiKey（每行一个）</p>
               <p class="mt-1 font-mono">email----password----clientId----refreshToken</p>
               <p class="mt-2">导入仅用于账号配置管理，不再执行刷新流程。</p>
               <p class="mt-1">注册失败建议关闭无头浏览器再试</p>
@@ -1709,10 +1710,81 @@ const parseImportLines = (raw: string) => {
       return
     }
 
+    if (parts.length === 1 && parts[0]) {
+      const apiKey = parts[0]
+      items.push({
+        id: `exa_${lineNo}`,
+        secure_c_ses: '',
+        csesidx: '',
+        config_id: '',
+        exa_api_key: apiKey,
+      })
+      return
+    }
+
     errors.push(`第 ${lineNo} 行格式错误`)
   })
 
   return { items, errors }
+}
+
+const CONFIG_EXPORT_FIELDS = [
+  'id',
+  'secure_c_ses',
+  'host_c_oses',
+  'csesidx',
+  'config_id',
+  'exa_api_key',
+  'coupon_code',
+  'coupon_status',
+  'balance',
+  'expires_at',
+  'disabled',
+  'trial_end',
+  'mail_provider',
+  'mail_address',
+  'mail_password',
+  'mail_client_id',
+  'mail_refresh_token',
+  'mail_tenant',
+  'mail_base_url',
+  'mail_jwt_token',
+  'mail_verify_ssl',
+  'mail_domain',
+  'mail_api_key',
+]
+
+const normalizeConfigItem = (item: Record<string, unknown>) => {
+  const next: Record<string, unknown> = {}
+  CONFIG_EXPORT_FIELDS.forEach((key) => {
+    if (key in item) {
+      next[key] = item[key]
+    }
+  })
+  return next
+}
+
+const normalizeConfigList = (list: Record<string, unknown>[]) =>
+  list.map((item) => normalizeConfigItem(item))
+
+const validateConfigItems = (list: Record<string, unknown>[]) => {
+  const errors: string[] = []
+  list.forEach((item, index) => {
+    const lineNo = index + 1
+    const exaKey = String(item.exa_api_key || '').trim()
+    if (exaKey) return
+    const mailProvider = String(item.mail_provider || '').trim()
+    const mailAddress = String(item.mail_address || '').trim()
+    if (mailProvider && mailAddress) return
+    const missing: string[] = []
+    if (!String(item.secure_c_ses || '').trim()) missing.push('secure_c_ses')
+    if (!String(item.csesidx || '').trim()) missing.push('csesidx')
+    if (!String(item.config_id || '').trim()) missing.push('config_id')
+    if (missing.length) {
+      errors.push(`第 ${lineNo} 条缺少必需字段：${missing.join(', ')}`)
+    }
+  })
+  return { ok: errors.length === 0, errors }
 }
 
 const triggerImportFile = () => {
@@ -1735,12 +1807,18 @@ const handleImportFile = async (event: Event) => {
         importError.value = 'JSON 格式错误：需要数组或包含 accounts 字段'
         return
       }
+      const normalizedList = normalizeConfigList(importList)
+      const validation = validateConfigItems(normalizedList)
+      if (!validation.ok) {
+        importError.value = validation.errors.slice(0, 3).join('，')
+        return
+      }
       const existing = await loadConfigList()
       const next = [...existing]
       const indexMap = new Map(next.map((acc, idx) => [acc.id, idx]))
       const importedIds: string[] = []
 
-      importList.forEach((item: any) => {
+      normalizedList.forEach((item: any) => {
         const idx = indexMap.get(item.id || '')
         if (idx === undefined) {
           next.push(item)
@@ -1799,22 +1877,24 @@ const handleImport = async () => {
       }
 
       const existing = next[idx]
-      const updated: AccountConfigItem = {
-        ...existing,
-        mail_provider: item.mail_provider,
-        mail_address: item.mail_address,
+      const updated: AccountConfigItem = { ...existing }
+      if (item.mail_provider) {
+        updated.mail_provider = item.mail_provider
+        updated.mail_address = item.mail_address
+        if (item.mail_provider === 'microsoft') {
+          updated.mail_client_id = item.mail_client_id
+          updated.mail_refresh_token = item.mail_refresh_token
+          updated.mail_tenant = item.mail_tenant
+          updated.mail_password = item.mail_password
+        } else {
+          updated.mail_password = item.mail_password
+          updated.mail_client_id = undefined
+          updated.mail_refresh_token = undefined
+          updated.mail_tenant = undefined
+        }
       }
-
-      if (item.mail_provider === 'microsoft') {
-        updated.mail_client_id = item.mail_client_id
-        updated.mail_refresh_token = item.mail_refresh_token
-        updated.mail_tenant = item.mail_tenant
-        updated.mail_password = item.mail_password
-      } else {
-        updated.mail_password = item.mail_password
-        updated.mail_client_id = undefined
-        updated.mail_refresh_token = undefined
-        updated.mail_tenant = undefined
+      if (item.exa_api_key) {
+        updated.exa_api_key = item.exa_api_key
       }
 
       next[idx] = updated
@@ -1847,7 +1927,7 @@ const exportConfig = async (format: 'json' | 'txt', scope: 'all' | 'selected' = 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
 
     if (format === 'json') {
-      const payload = JSON.stringify(list, null, 2)
+      const payload = JSON.stringify(normalizeConfigList(list as unknown as Record<string, unknown>[]), null, 2)
       downloadText(payload, `accounts-${timestamp}.json`, 'application/json')
       toast.success('导出 JSON 成功')
       return
@@ -2295,9 +2375,11 @@ const maskConfig = (list: AccountConfigItem[]) => {
     'csesidx',
     'config_id',
     'host_c_oses',
+    'exa_api_key',
     'mail_password',
     'mail_refresh_token',
     'mail_client_id',
+    'mail_api_key',
   ])
   return list.map((item) => {
     const next = { ...item }

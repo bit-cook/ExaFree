@@ -766,6 +766,7 @@ def load_multi_account_config(
     manager = MultiAccountManager(session_cache_ttl_seconds)
 
     accounts_data = load_accounts_from_source()
+    skipped = 0
 
     for i, acc in enumerate(accounts_data, 1):
         # 兼容 Exa 账号与历史账号配置：
@@ -776,7 +777,11 @@ def load_multi_account_config(
             required_fields = ["secure_c_ses", "csesidx", "config_id"]
             missing_fields = [f for f in required_fields if not acc.get(f)]
             if missing_fields:
-                raise ValueError(f"账户 {i} 缺少必需字段: {', '.join(missing_fields)}")
+                skipped += 1
+                logger.warning(
+                    f"[CONFIG] 跳过无效账户 {i}: 缺少必需字段 {', '.join(missing_fields)}"
+                )
+                continue
 
         config = AccountConfig(
             account_id=get_account_id(acc, i),
@@ -821,6 +826,8 @@ def load_multi_account_config(
         if is_expired:
             manager.accounts[config.account_id].is_available = False
 
+    if skipped:
+        logger.warning(f"[CONFIG] 已跳过 {skipped} 个无效账户配置")
     if not manager.accounts:
         logger.warning(f"[CONFIG] 没有有效的账户配置，服务将启动但无法处理请求，请在管理面板添加账户")
     else:
