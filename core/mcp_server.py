@@ -1,15 +1,19 @@
 import json
 import logging
-import os
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
+
+try:
+    from mcp.server.dependencies import get_http_headers as _get_http_headers  # type: ignore
+except Exception:  # pragma: no cover - optional dependency path
+    _get_http_headers = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 # Initialize MCP server
-mcp = FastMCP("exa-pool")
+mcp = FastMCP("exa-pool", streamable_http_path="/")
 
 # HTTP client timeout settings
 TIMEOUT = httpx.Timeout(30.0, connect=5.0)
@@ -17,8 +21,39 @@ TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 def _get_mcp_config() -> Dict[str, str]:
     base_url = "http://127.0.0.1:7860"
-    api_key = os.getenv("EXA_POOL_API_KEY", "").strip()
-    return {"base_url": base_url, "api_key": api_key}
+    return {"base_url": base_url}
+
+
+def _extract_bearer_token(auth_header: str) -> str:
+    auth = (auth_header or "").strip()
+    if not auth:
+        return ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return auth
+
+
+def _get_request_api_key(context: Optional[Context] = None) -> str:
+    if context is not None:
+        try:
+            request = context.request_context.request
+            if request is not None and hasattr(request, "headers"):
+                auth_header = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+                token = _extract_bearer_token(auth_header)
+                if token:
+                    return token
+        except Exception as exc:
+            logger.error("Failed to read MCP request headers from context: %s", exc)
+
+    if _get_http_headers is None:
+        return ""
+    try:
+        headers = _get_http_headers() or {}
+    except Exception as exc:
+        logger.error("Failed to read MCP HTTP headers: %s", exc)
+        return ""
+
+    return _extract_bearer_token(headers.get("authorization") or headers.get("Authorization") or "")
 
 
 def format_error(status_code: int, message: str) -> str:
@@ -40,15 +75,16 @@ async def make_exa_request(
     method: str = "POST",
     data: Optional[dict] = None,
     params: Optional[dict] = None,
+    context: Optional[Context] = None,
 ) -> str:
     """
     Make a request to the Exa Pool API with proper error handling.
     """
     config = _get_mcp_config()
     base_url = config["base_url"]
-    api_key = config["api_key"]
+    api_key = _get_request_api_key(context)
     if not api_key:
-        return "Error: EXA_POOL_API_KEY is not configured."
+        return "Error: Authorization Bearer token is required."
 
     url = f"{base_url.rstrip('/')}{endpoint}"
     headers = {
@@ -114,6 +150,7 @@ async def exa_search(
     num_results: int = 10,
     search_type: str = "auto",
     include_text: bool = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Search the web using Exa's AI-powered search engine."""
     if not query or not query.strip():
@@ -137,12 +174,15 @@ async def exa_search(
         num_results,
         search_type,
     )
-    return await make_exa_request("/search", data=payload)
+    return await make_exa_request("/search", data=payload, context=ctx)
 
 
 @mcp.tool()
 async def exa_get_contents(
-    urls: List[str], include_text: bool = True, include_html: bool = False
+    urls: List[str],
+    include_text: bool = True,
+    include_html: bool = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Get clean, parsed content from one or more web pages."""
     if not urls or len(urls) == 0:
@@ -158,12 +198,15 @@ async def exa_get_contents(
         payload["htmlContent"] = True
 
     logger.info("MCP contents: %s urls", len(urls))
-    return await make_exa_request("/contents", data=payload)
+    return await make_exa_request("/contents", data=payload, context=ctx)
 
 
 @mcp.tool()
 async def exa_find_similar(
-    url: str, num_results: int = 10, include_text: bool = False
+    url: str,
+    num_results: int = 10,
+    include_text: bool = False,
+    ctx: Optional[Context] = None,
 ) -> str:
     """Find web pages similar to a given URL using semantic similarity."""
     if not url or not url.strip():
@@ -178,22 +221,26 @@ async def exa_find_similar(
         payload["contents"] = {"text": True}
 
     logger.info("MCP findSimilar: %s", url)
-    return await make_exa_request("/findSimilar", data=payload)
+    return await make_exa_request("/findSimilar", data=payload, context=ctx)
 
 
 @mcp.tool()
-async def exa_answer(query: str, include_text: bool = False) -> str:
+async def exa_answer(query: str, include_text: bool = False, ctx: Optional[Context] = None) -> str:
     """Get an AI-generated answer to a question using Exa's Answer API."""
     if not query or not query.strip():
         return "Error: query parameter is required and cannot be empty"
 
     payload = {"query": query.strip(), "text": include_text}
     logger.info("MCP answer: %s", query)
-    return await make_exa_request("/answer", data=payload)
+    return await make_exa_request("/answer", data=payload, context=ctx)
 
 
 @mcp.tool()
-async def exa_create_research(instructions: str, model: str = "exa-research") -> str:
+async def exa_create_research(
+    instructions: str,
+    model: str = "exa-research",
+    ctx: Optional[Context] = None,
+) -> str:
     """Create an asynchronous deep research task."""
     if not instructions or not instructions.strip():
         return "Error: instructions parameter is required and cannot be empty"
@@ -204,18 +251,40 @@ async def exa_create_research(instructions: str, model: str = "exa-research") ->
 
     payload = {"instructions": instructions.strip(), "model": model}
     logger.info("MCP create research: model=%s", model)
-    return await make_exa_request("/research/v1", data=payload)
+    return await make_exa_request("/research/v1", data=payload, context=ctx)
 
 
 @mcp.tool()
-async def exa_get_research(research_id: str) -> str:
+async def exa_get_research(research_id: str, ctx: Optional[Context] = None) -> str:
     """Get the status and results of a research task."""
     if not research_id or not research_id.strip():
         return "Error: research_id parameter is required and cannot be empty"
 
     logger.info("MCP get research: %s", research_id)
-    return await make_exa_request(f"/research/v1/{research_id.strip()}", method="GET")
+    return await make_exa_request(
+        f"/research/v1/{research_id.strip()}",
+        method="GET",
+        context=ctx,
+    )
 
 
 def get_mcp_http_app():
-    return mcp.http_app(path="/")
+    if hasattr(mcp, "streamable_http_app"):
+        return mcp.streamable_http_app()
+    if hasattr(mcp, "http_app"):
+        return mcp.http_app(path="/")
+    if hasattr(mcp, "sse_app"):
+        return mcp.sse_app(mount_path="/")
+    raise RuntimeError("MCP server does not support HTTP transport")
+
+
+def get_mcp_session_manager():
+    if hasattr(mcp, "streamable_http_app"):
+        try:
+            if getattr(mcp, "_session_manager", None) is None:
+                mcp.streamable_http_app()
+            return mcp.session_manager
+        except Exception as exc:
+            logger.warning("MCP session manager not available: %s", exc)
+            return None
+    return None
